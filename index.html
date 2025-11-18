@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>Google ADK × FastAPI × WebSocket 分割レスポンス設計メモ</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.6;
+      margin: 24px;
+      color: #222;
+    }
+    h1, h2, h3 {
+      margin-top: 1.6em;
+      border-left: 4px solid #4b9fff;
+      padding-left: 8px;
+    }
+    h1 {
+      border-left-width: 6px;
+    }
+    code {
+      font-family: Menlo, Consolas, "Courier New", monospace;
+      font-size: 0.9em;
+      background: #f5f5f5;
+      padding: 0 3px;
+      border-radius: 3px;
+    }
+    pre {
+      background: #f5f5f5;
+      border-radius: 6px;
+      padding: 12px;
+      overflow-x: auto;
+      font-size: 0.9em;
+    }
+    pre code {
+      background: transparent;
+      padding: 0;
+    }
+    .note {
+      padding: 8px 10px;
+      border-left: 4px solid #ffb100;
+      background: #fff7e0;
+      margin: 16px 0;
+      font-size: 0.9em;
+    }
+    .section {
+      margin-bottom: 32px;
+    }
+    ul {
+      margin-top: 0.4em;
+      margin-bottom: 0.4em;
+    }
+    @media print {
+      body {
+        margin: 10mm 15mm;
+      }
+      pre {
+        page-break-inside: avoid;
+      }
+    }
+  </style>
+</head>
+<body>
+  <h1>Google ADK InMemory Runner × FastAPI WebSocket で<br>一次回答 → ツール実行 → 最終回答を分割送信する構成</h1>
+
+  <div class="note">
+    このメモは、<strong>Google ADK の InMemory Runner で生成されたイベントストリームを、
+    FastAPI WebSocket を通じてクライアントに「フェーズ別」に返すための設計とサンプルコード</strong>をまとめたものです。<br>
+    印刷して参照できるよう、説明とコードを 1 ページに整理しています。
+  </div>
+
+  <div class="section">
+    <h2>1. やりたいことの整理</h2>
+    <p>
+      目的は、Google ADK（InMemoryRunner）で実行されるエージェントの挙動を、
+      クライアント側に次のような 3 フェーズで見せることです。
+    </p>
+    <ul>
+      <li><strong>一次回答生成...</strong>（モデルがとりあえず出したドラフト）</li>
+      <li><strong>ツール実行...</strong>（ツール呼び出し・結果）</li>
+      <li><strong>最終回答生成...</strong>（ツール結果も踏まえた最終的な回答）</li>
+    </ul>
+    <p>
+      これを <code>FastAPI + WebSocket</code> の構成で、クライアントに JSON をフェーズ別に送ります。
+      クライアント側では <code>phase: "draft" | "tool_start" | "tool_result" | "final"</code> などで UI を切り替えます。
+    </p>
+  </div>
+
+  <div class="section">
+    <h2>2. 設計のポイント</h2>
+    <h3>2-1. ADK イベントから取りたい情報</h3>
+    <p>InMemoryRunner の <code>run_async()</code> は、以下のような情報を含むイベントをストリームします：</p>
+    <ul>
+      <li><strong>テキスト</strong>: <code>event.content.parts[0].text</code></li>
+      <li><strong>ツール呼び出し</strong>: <code>event.get_function_calls()</code></li>
+      <li><strong>ツールからのレスポンス</strong>: <code>event.get_function_responses()</code></li>
+      <li><strong>部分かどうか</strong>: <code>event.partial</code></li>
+      <li><strong>最終回答かどうか</strong>: <code>event.is_final_response()</code></li>
+    </ul>
+    <p>
+      これらを判定に使い、以下のように WebSocket で送ります：
+    </p>
+    <ul>
+      <li>ツール呼び出し前に出たテキスト → <strong>一次回答</strong>（<code>phase: "draft"</code>）</li>
+      <li>ツール呼び出し検出 → <strong>ツール実行開始通知</strong>（<code>phase: "tool_start"</code>）</li>
+      <li>ツール結果 → <strong>ツール結果通知</strong>（<code>phase: "tool_result"</code>）</li>
+      <li><code>event.is_final_response() == True</code> → <strong>最終回答</strong>（<code>phase: "final"</code>）</li>
+    </ul>
+  </div>
+
+  <div class="section">
+    <h2>3. サーバサイド実装（FastAPI + WebSocket + ADK）</h2>
+
+    <h3>3-1. 全体像</h3>
+    <p>以下は、説明用の最小構成サンプルです。</p>
+    <ul>
+      <li>ダミーのツール <code>search_products()</code> を持つエージェントを定義</li>
+      <li><code>/ws/chat</code> WebSocket エンドポイントでクライアントとやりとり</li>
+      <li>1 回のユーザーメッセージに対して <code>handle_one_turn()</code> で ADK イベントを処理</li>
+    </ul>
+
+    <pre><code class="language-python"># main.py
+import uuid
+import asyncio
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+
+from google.adk.agents import Agent
+from google.adk.runners import InMemoryRunner
+from google.genai import types
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 本番では適宜絞る
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==== 1. ADK Agent 定義（サンプルの単純なエージェント） =================
+
+def search_products(keyword: str) -&gt; dict:
+    """ダミーツール: 商品検索"""
+    return {
+        "status": "success",
+        "items": [
+            {"name": f"{keyword} Pro", "price": 1000},
+            {"name": f"{keyword} Lite", "price": 500},
+        ],
+    }
+
+root_agent = Agent(
+    name="demo_agent",
+    model="gemini-2.0-flash",  # 実際の環境に合わせて変更
+    description="Demo agent with a search tool.",
+    instruction=(
+        "ユーザーの質問に答えつつ、必要なら search_products ツールを呼び出してください。"
+    ),
+    tools=[search_products],
+)
+
+runner = InMemoryRunner(agent=root_agent, app_name="demo_app")
+session_service = runner.session_service  # セッション管理に利用
+
+
+# ==== 2. WebSocket ハンドラ =============================================
+
+@app.websocket("/ws/chat")
+async def chat_ws(ws: WebSocket):
+    await ws.accept()
+    user_id = "user-" + str(uuid.uuid4())
+    session_id = "session-" + str(uuid.uuid4())
+
+    # セッション作成（同じ session_id を run_async に渡す）
+    await session_service.create_session(
+        app_name="demo_app",
+        user_id=user_id,
+        session_id=session_id,
+    )
+
+    try:
+        while True:
+            # クライアントからユーザーメッセージ受信
+            data = await ws.receive_json()
+            user_message: str = data.get("message", "")
+
+            # ADK に投げる Content
+            new_message = types.Content(
+                role="user",
+                parts=[types.Part(text=user_message)],
+            )
+
+            # 1 回の質問に対する処理を別タスクで開始
+            asyncio.create_task(
+                handle_one_turn(ws, user_id, session_id, new_message)
+            )
+
+    except WebSocketDisconnect:
+        # 切断時の後始末などを必要に応じて
+        return
+
+
+# ==== 3. 1 回の質問に対して ADK イベントをさばく処理 ====================
+
+async def handle_one_turn(
+    ws: WebSocket,
+    user_id: str,
+    session_id: str,
+    new_message: types.Content,
+):
+    # 一次回答用バッファ
+    draft_text = ""
+    draft_sent = False
+
+    # 最終回答バッファ
+    full_response_text = ""
+
+    tools_started = False
+
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=new_message,
+    ):
+        # --- テキストがあれば回収 ---
+        text = None
+        if event.content and event.content.parts:
+            part = event.content.parts[0]
+            if getattr(part, "text", None):
+                text = part.text or ""
+
+        # ストリーミングテキスト蓄積（最終回答用）
+        if text:
+            full_response_text += text
+
+            # まだツール呼び出し前 &amp; draft 未送信 &amp; partial でないときに一次回答送信
+            if not tools_started and not draft_sent and not event.partial:
+                draft_text = full_response_text
+                await ws.send_json(
+                    {
+                        "phase": "draft",  # 一次回答
+                        "text": draft_text,
+                    }
+                )
+                draft_sent = True
+
+        # --- ツール呼び出し検出 ---
+        calls = event.get_function_calls()
+        if calls and not tools_started:
+            tools_started = True
+            # ツール実行スタート通知
+            await ws.send_json(
+                {
+                    "phase": "tool_start",
+                    "tools": [
+                        {
+                            "name": call.name,
+                            "args": call.args,
+                        }
+                        for call in calls
+                    ],
+                    "message": "ツール実行を開始しました。",
+                }
+            )
+
+        # --- ツール結果 ---
+        responses = event.get_function_responses()
+        if responses:
+            await ws.send_json(
+                {
+                    "phase": "tool_result",
+                    "results": [
+                        {
+                            "name": r.name,
+                            "response": r.response,
+                        }
+                        for r in responses
+                    ],
+                }
+            )
+
+        # --- 最終回答判定 ---
+        if event.is_final_response():
+            final_text = full_response_text.strip()
+
+            await ws.send_json(
+                {
+                    "phase": "final",
+                    "text": final_text,
+                }
+            )
+            # この turn は終了
+            break
+</code></pre>
+  </div>
+
+  <div class="section">
+    <h2>4. クライアント側（WebSocket）の扱いイメージ</h2>
+    <p>
+      クライアントは WebSocket から受信した JSON の <code>phase</code> を見て、
+      メッセージの出し方や UI を切り替えます。
+    </p>
+
+    <pre><code class="language-javascript">const socket = new WebSocket("wss://example.com/ws/chat");
+
+socket.onmessage = (event) =&gt; {
+  const data = JSON.parse(event.data);
+
+  switch (data.phase) {
+    case "draft":
+      // 一次回答：とりあえず出す（タイピング演出で出してもよい）
+      addBotMessage(data.text, { phase: "draft" });
+      break;
+
+    case "tool_start":
+      // ツール実行開始のログを表示
+      addSystemMessage("ツール実行中です…");
+      console.log("tools:", data.tools);
+      break;
+
+    case "tool_result":
+      // ツール結果ログを表示（またはコンソールのみ）
+      console.log("tool result:", data.results);
+      break;
+
+    case "final":
+      // 最終回答：別メッセージとして出す or 既存メッセージを書き換える
+      addBotMessage(data.text, { phase: "final" });
+      break;
+  }
+};
+
+function addBotMessage(text, options) {
+  // ここに、先ほど作った「.bot-message を追加してタイピング表示する」処理をつなぐ
+}
+
+function addSystemMessage(text) {
+  // ログ行などを追加する処理
+}
+</code></pre>
+  </div>
+
+  <div class="section">
+    <h2>5. まとめ</h2>
+    <ul>
+      <li>Google ADK の InMemory Runner は、イベントストリームから
+        <code>text</code> / <code>function_calls</code> / <code>function_responses</code> /
+        <code>is_final_response()</code> を取り出せる。</li>
+      <li>これを <strong>フェーズ別に JSON で WebSocket に流す</strong>ことで、
+        「一次回答 → ツール実行 → 最終回答」という UX を実装できる。</li>
+      <li>クライアント側では、<code>phase</code> をキーにして
+        表示方法やタイピング演出を切り替える。</li>
+    </ul>
+    <p>
+      この HTML をそのままブラウザで開けば、印刷プレビューも確認できます。
+      実プロジェクトでは、モデル名・ツール・セッション管理などを環境に合わせて調整してください。
+    </p>
+  </div>
+</body>
+</html>
+```
